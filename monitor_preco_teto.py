@@ -51,6 +51,8 @@ RETORNO_EXIGIDO = 0.12        # Gordon: taxa de retorno exigida (k) ao ano
 CRESCIMENTO_PERPETUO = 0.04   # Gordon: crescimento perpétuo dos dividendos (g)
 PL_ALVO = 10                  # P/L máximo que você paga
 PVP_ALVO = 1.5                # P/VP máximo que você paga (Graham usa 1,5)
+ANOS_PROJECAO_FCD = 5         # FCD: por quantos anos projetar o fluxo de caixa
+CRESCIMENTO_FCD = 0.05        # FCD: crescimento anual do fluxo de caixa livre nesses anos
 
 # Monitoramento
 INTERVALO_SEGUNDOS = 60       # (modo loop) de quanto em quanto tempo consultar
@@ -65,7 +67,7 @@ ARQUIVO_ESTADO = "estado.json"  # guarda tetos do dia e alertas já enviados
 
 # ======================================================================
 
-METODOS = ["Bazin", "Graham", "Gordon (DDM)", "P/L alvo", "P/VP alvo"]
+METODOS = ["Bazin", "Graham", "Gordon (DDM)", "P/L alvo", "P/VP alvo", "FCD"]
 
 
 def brl(v):
@@ -95,6 +97,59 @@ def dividendos(ativo):
     return float(d12), float(d5 / anos)
 
 
+def fluxo_caixa_livre(ativo):
+    """Retorna o Fluxo de Caixa Livre (FCL) do último ano disponível, se houver."""
+    try:
+        cf = ativo.cashflow
+    except Exception:
+        return None
+    if cf is None or cf.empty:
+        return None
+
+    # Versões novas do yfinance já trazem a linha pronta
+    if "Free Cash Flow" in cf.index:
+        serie = cf.loc["Free Cash Flow"].dropna()
+        if not serie.empty:
+            return float(serie.iloc[0])
+
+    # Senão, calcula: Caixa das Operações - Investimentos (Capex)
+    ocf = capex = None
+    for rotulo in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
+        if rotulo in cf.index:
+            serie = cf.loc[rotulo].dropna()
+            if not serie.empty:
+                ocf = float(serie.iloc[0])
+                break
+    for rotulo in ["Capital Expenditure", "Capital Expenditures"]:
+        if rotulo in cf.index:
+            serie = cf.loc[rotulo].dropna()
+            if not serie.empty:
+                capex = float(serie.iloc[0])
+                break
+    if ocf is not None and capex is not None:
+        return ocf + capex  # capex já vem negativo nos dados do Yahoo
+    return None
+
+
+def calcular_dcf(fcl_atual, n_acoes):
+    """Projeta o FCL, desconta a valor presente e soma o valor terminal (perpetuidade)."""
+    if not (_positivo(fcl_atual) and _positivo(n_acoes)):
+        return None
+    if RETORNO_EXIGIDO <= CRESCIMENTO_PERPETUO:
+        return None
+
+    valor_presente = 0.0
+    fcl = fcl_atual
+    for ano in range(1, ANOS_PROJECAO_FCD + 1):
+        fcl *= (1 + CRESCIMENTO_FCD)
+        valor_presente += fcl / (1 + RETORNO_EXIGIDO) ** ano
+
+    valor_terminal = fcl * (1 + CRESCIMENTO_PERPETUO) / (RETORNO_EXIGIDO - CRESCIMENTO_PERPETUO)
+    valor_presente += valor_terminal / (1 + RETORNO_EXIGIDO) ** ANOS_PROJECAO_FCD
+
+    return valor_presente / n_acoes
+
+
 def calcular_tetos(ticker):
     """Calcula os preços teto de uma ação. Métodos sem dados ficam como None."""
     ativo = yf.Ticker(f"{ticker}.SA")
@@ -105,10 +160,15 @@ def calcular_tetos(ticker):
 
     lpa = info.get("trailingEps")
     vpa = info.get("bookValue")
+    n_acoes = info.get("sharesOutstanding")
     try:
         dpa12, dpa_medio = dividendos(ativo)
     except Exception:
         dpa12, dpa_medio = None, None
+    try:
+        fcl = fluxo_caixa_livre(ativo)
+    except Exception:
+        fcl = None
 
     tetos = dict.fromkeys(METODOS)
 
@@ -133,6 +193,9 @@ def calcular_tetos(ticker):
     # 5) P/VP alvo x VPA
     if _positivo(vpa):
         tetos["P/VP alvo"] = PVP_ALVO * vpa
+
+    # 6) FCD: fluxo de caixa livre projetado e descontado a valor presente
+    tetos["FCD"] = calcular_dcf(fcl, n_acoes)
 
     return tetos
 
